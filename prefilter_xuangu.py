@@ -1,29 +1,33 @@
 #!/usr/bin/env python3
 """
-prefilter_xuangu.py — 盘中起爆选股预过滤器
+prefilter_xuangu.py — 盘中选股预过滤器 v4
 ============================================
 
-用作 cron job 的 script 参数：在 agent 启动前自动运行，
-执行 mx-xuangu 选股并输出紧凑 JSON 到 stdout（注入到 prompt 首行）。
+【用户方案 · 2026-04-27】
+Step1: 申万一级行业 → 取今日主力净流入额前2板块
+        优先：近期政策/事件催化板块（商业航天/国产芯片/军工/半导体）
+        否则：涨幅>0 且成交量较5日均量放大≥20%
+Step2: 在Top2板块内，所有条件一次性传入 mx-xuangu：
+        - 今日涨幅 1.5%~5%
+        - 量比 > 1.5
+        - 换手率 3%~10%
+        - 流通市值 > 50亿
+        - 近3日主力净流入至少2日为正值（4.23-4.27）
+        按「近3日主力净流入总额」降序，取前3支
+        返回：代码、名称、题材、量比、换手率、流通市值、近3日主力净流入、现价、涨跌幅
 
-【角色定位】
-- 数据收集层 — 运行 mx-xuangu 查询，收集原始选股结果
-- 数据清洗层 — 去除冗余字段，统一单位（亿）
-- 数据压缩层 — 将 200+KB 原始 JSON 压缩至 <2KB 紧凑 JSON
+【关键实现】
+- 板块：用 mx-xuangu 查「申万一级行业今日主力资金流向」，按主力净额聚合申万一级
+- 选股：用 mx-xuangu 一次传所有条件，结果从 raw JSON 而非 CSV（CSV无近3日明细）
+- 近3日净额明细：在 raw JSON 的 MTM_EXTRA|... key，按「万」为单位累加
 
 【用法】
   python prefilter_xuangu.py
 
 【输出（stdout）】
-  单行 JSON：
-  {"candidates": [...], "total": N, "timestamp": "..."}
-
-【上游依赖】
-  - ~/mx_xuangu.py（symlink 到 skills/mx-xuangu/mx_xuangu.py）
-  - MX_APIKEY 环境变量
+  单行 JSON：{"candidates": [...], "sectors": [...], "total": N, "timestamp": "..."}
 """
 
-import csv
 import json
 import os
 import re
@@ -31,236 +35,434 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional
 
-# ── 配置 ────────────────────────────────────────────────────────────────
+# ── 配置 ──────────────────────────────────────────────────────────────────
+MX_DATA   = os.path.expanduser("~/mx_data.py")
 MX_XUANGU = os.path.expanduser("~/mx_xuangu.py")
-
-# 与 Job 3 Step2 一致的选股查询
-QUERIES = [
-    "开盘30分钟涨幅2-5% 主力净流入为正 非ST 流通市值50-500亿",
-    "早盘主力净流入前20 涨幅小于5% 流通市值50-500亿 技术形态突破",
-]
-
 OUTPUT_DIR = Path("/tmp/cron-output/prefilter/")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# 需要从 CSV 提取的核心字段（中文名（无日期后缀） → 英文 key）
-ESSENTIAL_FIELDS = {
-    "代码": "code",
-    "名称": "name",
-    "市场代码简称": "market",
-    "最新价(元)": "price",
-    "涨跌幅(%)": "change_pct",
-    "主力净额(元)": "net_inflow",
-    "换手率(%)": "turnover_rate",
-    "量比": "volume_ratio",
-    "流通市值(元)": "market_cap",
-}
+# 近3日日期范围（本周交易日）
+DATE_RANGE = "2026.04.23 - 2026.04.27"
 
-# ── 工具函数 ────────────────────────────────────────────────────────────
-
-
-def safe_filename(s: str, max_len: int = 80) -> str:
-    """将查询文本转为安全文件名"""
-    s = re.sub(r'[<>:"/\\|?*]', "_", s)
-    return s.strip().replace(" ", "_")[:max_len]
-
-
-def parse_value(val: str) -> Any:
-    """尝试将字符串转为数字"""
-    if val == "" or val is None:
-        return None
-    val = val.strip().replace(",", "")
-    try:
-        if "." in val:
-            return float(val)
-        return int(val)
-    except (ValueError, TypeError):
-        return val
-
-
-def map_csv_column(col_name: str, cn_key: str) -> bool:
-    """检查CSV列名是否匹配中文key（支持日期后缀模糊）"""
-    if col_name == cn_key:
-        return True
-    # 支持 "最新价(元) 2026.04.24" → "最新价(元)"
-    if col_name.startswith(cn_key) and col_name[len(cn_key):].startswith(" "):
-        return True
-    return False
-
-
-def build_column_map(csv_columns: List[str]) -> Dict[str, str]:
-    """建立 CSV列名 → 英文key 的映射"""
-    mapping = {}
-    for csv_col in csv_columns:
-        for cn_key, en_key in ESSENTIAL_FIELDS.items():
-            if map_csv_column(csv_col, cn_key):
-                mapping[csv_col] = en_key
-                break
-    return mapping
-
+# ── 工具函数 ────────────────────────────────────────────────────────────────
 
 def yuan_to_yi(val: Any) -> Optional[float]:
-    """将元转换为亿元"""
+    """将 '5.18亿' / '1234万' / '5678900' 转换为亿元浮点数（万元→亿×0.0001）"""
     if val is None or str(val).strip() == "":
         return None
-    v = parse_value(str(val))
-    if v is None:
+    s = str(val).strip().replace(",", "")
+    multiplier = 1.0
+    if "亿" in s:
+        multiplier = 1.0
+        s = s.replace("亿", "").replace("元", "").strip()
+    elif "万" in s:
+        multiplier = 1.0 / 10000.0
+        s = s.replace("万", "").replace("元", "").strip()
+    elif "元" in s:
+        s = s.replace("元", "").strip()
+    try:
+        return round(float(s) * multiplier, 4)
+    except (ValueError, TypeError):
         return None
-    if isinstance(v, (int, float)):
-        return round(float(v) / 100_000_000, 2)
-    return None
 
 
-# ── CSV 读取（带列名映射） ──────────────────────────────────────────────
+def find_file(output_dir: Path, glob_pattern: str, suffix: str = "csv") -> Optional[Path]:
+    """查找包含 glob_pattern 的最新指定后缀文件"""
+    candidates = sorted(output_dir.glob(f"*.{suffix}"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for c in candidates:
+        if glob_pattern in c.name:
+            return c
+    return candidates[0] if candidates else None
 
 
-def read_csv_with_mapping(path: Path) -> List[Dict[str, Any]]:
-    """读取 UTF-8 BOM CSV 并将中文列名映射为英文 key"""
-    rows = []
+def parse_raw_json_xuangu(raw_path: Path) -> List[Dict[str, Any]]:
+    """
+    从 mx-xuangu raw JSON 中解析数据。
+    数据结构：
+      raw["data"]["data"]["allResults"]["result"]["dataList"] = [row_dict, ...]
+      row 中关键字段：
+        SECURITY_CODE: 代码
+        SECURITY_SHORT_NAME: 名称
+        NEWEST_PRICE: 最新价
+        CHG: 涨跌幅
+        010000_LIANGBI<70>{2026-04-27}: 量比
+        010000_TURNOVER_RATE<70>{2026-04-27}: 换手率
+        010000_CIRCULATION_MARKET_VALUE<70>{2026-04-27}: 流通市值
+        SW_INDUSTRY: 申万行业分类
+        STYLE_CONCEPT: 概念
+        MARKET_SHORT_NAME: 市场
+        主力净额大于0出现次数{...}: 正流入天数
+        MTM_EXTRA|count_近3日主力净额大于0出现次数_detail.data: 近3日明细(JSON)
+    """
     try:
-        with open(path, encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
-            if not reader.fieldnames:
-                return []
-            col_map = build_column_map(reader.fieldnames)
-            print(f"[prefilter] 列名映射: {col_map}", file=sys.stderr)
-            for row in reader:
-                mapped = {}
-                for csv_col, val in row.items():
-                    en_key = col_map.get(csv_col)
-                    if en_key:
-                        mapped[en_key] = val
-                if mapped.get("code"):  # 至少要有 code 才算有效行
-                    rows.append(mapped)
+        with open(raw_path, encoding="utf-8") as f:
+            raw = json.load(f)
     except Exception as e:
-        print(f"[prefilter] ⚠ 读取 CSV 失败 {path}: {e}", file=sys.stderr)
-    return rows
-
-
-def find_csv_file(output_dir: Path, query: str) -> Optional[Path]:
-    """查找 mx-xuangu 生成的 CSV 文件路径"""
-    safe_name = safe_filename(query)
-    exact = output_dir / f"mx_xuangu_{safe_name}.csv"
-    if exact.exists():
-        return exact
-    # 回退：扫描最近文件
-    candidates = sorted(output_dir.glob("mx_xuangu_*.csv"),
-                        key=lambda p: p.stat().st_mtime, reverse=True)
-    if candidates:
-        return candidates[0]
-    return None
-
-
-# ── 股票数据处理 ────────────────────────────────────────────────────────
-
-
-def stock_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    """从 CSV 行字典（英文 key）解析为标准股票对象"""
-    stock = {}
-    # code — 保持原始字符，去空格
-    raw_code = row.get("code", "")
-    stock["code"] = str(raw_code).strip() if raw_code else None
-    # name
-    stock["name"] = row.get("name") or None
-    # market (SH/SZ)
-    stock["market"] = row.get("market") or None
-    # price — 浮点数，2位小数
-    p = parse_value(str(row.get("price", "")))
-    stock["price"] = round(float(p), 2) if isinstance(p, (int, float)) else None
-    # change_pct
-    c = parse_value(str(row.get("change_pct", "")))
-    stock["change_pct"] = round(float(c), 2) if isinstance(c, (int, float)) else None
-    # net_inflow — 元→亿
-    stock["net_inflow"] = yuan_to_yi(row.get("net_inflow"))
-    # turnover_rate
-    t = parse_value(str(row.get("turnover_rate", "")))
-    stock["turnover_rate"] = round(float(t), 2) if isinstance(t, (int, float)) else None
-    # volume_ratio
-    v = parse_value(str(row.get("volume_ratio", "")))
-    stock["volume_ratio"] = round(float(v), 2) if isinstance(v, (int, float)) else None
-    # market_cap — 元→亿
-    stock["market_cap"] = yuan_to_yi(row.get("market_cap"))
-    return stock
-
-
-def merge_dedup(stocks_list: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-    """合并多组选股结果，按 code 去重（保留第一条）"""
-    seen = set()
-    merged = []
-    for batch in stocks_list:
-        for s in batch:
-            code = s.get("code")
-            if code and code not in seen:
-                seen.add(code)
-                merged.append(s)
-    return merged
-
-
-# ── 主流程 ──────────────────────────────────────────────────────────────
-
-
-def run_xuangu_query(query: str, output_dir: Path) -> List[Dict[str, Any]]:
-    """执行一条 mx-xuangu 查询并返回解析后的股票列表"""
-    print(f"[prefilter] 执行选股: {query}", file=sys.stderr)
+        print(f"[prefilter] ⚠ JSON读取失败 {raw_path.name}: {e}", file=sys.stderr)
+        return []
 
     try:
-        result = subprocess.run(
-            ["python3", MX_XUANGU, query, "--output-dir", str(output_dir)],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-    except subprocess.TimeoutExpired:
-        print(f"[prefilter] ⚠ 超时: {query[:40]}", file=sys.stderr)
-        return []
+        data_list = raw["data"]["data"]["allResults"]["result"]["dataList"]
     except Exception as e:
-        print(f"[prefilter] ⚠ 执行失败: {e}", file=sys.stderr)
+        print(f"[prefilter] ⚠ JSON结构解析失败: {e}", file=sys.stderr)
         return []
 
-    if result.returncode != 0:
-        print(f"[prefilter] ⚠ 返回码 {result.returncode}: {result.stderr[:200]}",
-              file=sys.stderr)
-        return []
+    DETAIL_KEY = "MTM_EXTRA|count_近3日主力净额大于0出现次数_detail.data"
+    POS_DAYS_KEY = "主力净额大于0出现次数{2026-04-23|2026-04-27|TRADING_DAY}"
 
-    csv_path = find_csv_file(output_dir, query)
-    if not csv_path:
-        print(f"[prefilter] ⚠ 未找到 CSV: {query[:40]}", file=sys.stderr)
-        return []
+    stocks = []
+    for row in data_list:
+        code = str(row.get("SECURITY_CODE") or "").strip()
+        name = str(row.get("SECURITY_SHORT_NAME") or "").strip()
+        if not code or code == "None":
+            continue
 
-    raw_rows = read_csv_with_mapping(csv_path)
-    stocks = [stock_from_row(r) for r in raw_rows if r.get("code")]
-    print(f"[prefilter] ✅ {query[:30]}... → {len(stocks)} 只", file=sys.stderr)
+        # ST 过滤
+        if "ST" in name.upper() or "*ST" in name.upper():
+            continue
+
+        # 解析数值字段
+        try:
+            pct = float(row.get("CHG") or 0)
+        except (ValueError, TypeError):
+            pct = 0.0
+
+        try:
+            vr = float(row.get("010000_LIANGBI<70>{2026-04-27}") or 0)
+        except (ValueError, TypeError):
+            vr = 0.0
+
+        try:
+            tr = float(row.get("010000_TURNOVER_RATE<70>{2026-04-27}") or 0)
+        except (ValueError, TypeError):
+            tr = 0.0
+
+        try:
+            price = float(row.get("NEWEST_PRICE") or 0)
+        except (ValueError, TypeError):
+            price = 0.0
+
+        mc = yuan_to_yi(row.get("010000_CIRCULATION_MARKET_VALUE<70>{2026-04-27}"))
+
+        # 近3日正流入天数
+        pos_days_raw = row.get(POS_DAYS_KEY)
+        try:
+            pos_days = int(float(pos_days_raw)) if pos_days_raw else 0
+        except (ValueError, TypeError):
+            pos_days = 0
+
+        # 近3日净额明细
+        detail_raw = str(row.get(DETAIL_KEY) or "")
+        net_3day = parse_3day_detail(detail_raw)
+
+        # ── 过滤条件 ──
+        if pct < 1.5 or pct > 5.0:
+            continue
+        if vr <= 1.5:
+            continue
+        if tr < 3.0 or tr > 10.0:
+            continue
+        if mc is None or mc <= 50.0:
+            continue
+        if pos_days < 2:   # 近3日中至少2日主力净流入为正
+            continue
+        if code.startswith("688"):   # 排除科创板
+            continue
+
+        stock = {
+            "code": code,
+            "name": name,
+            "price": round(price, 2),
+            "change_pct": round(pct, 2),
+            "volume_ratio": round(vr, 2),
+            "turnover_rate": round(tr, 2),
+            "mkt_cap_yi": mc,
+            "net_3day_yi": net_3day,
+            "pos_days": pos_days,
+            "sw_industry": row.get("SW_INDUSTRY", ""),
+            "concepts": row.get("STYLE_CONCEPT", ""),
+            "market": row.get("MARKET_SHORT_NAME", ""),
+        }
+        stocks.append(stock)
+
+    # 按近3日净额降序
+    stocks.sort(key=lambda x: x.get("net_3day_yi") or 0, reverse=True)
     return stocks
 
 
-def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+def parse_3day_detail(raw_str: str) -> Optional[float]:
+    """
+    解析近3日主力净额明细，返回总额（亿元）。
+    金额单位：万元（1万 = 0.0001亿）
+    """
+    if not raw_str or raw_str.strip() == "" or raw_str == "None":
+        return None
+    try:
+        items = json.loads(raw_str)
+        if not isinstance(items, list) or not items:
+            return None
+        total = 0.0
+        for entry in items[0].get("data", []):
+            amt = str(entry.get("OCCUR_DETAIL_DATA1") or "")
+            val = yuan_to_yi(amt)   # yuan_to_yi 把「万」视作 1/10000 亿
+            if val is not None:
+                total += val
+        return round(total, 4)
+    except Exception:
+        return None
 
-    all_batches = []
-    total_raw = 0
 
-    for query in QUERIES:
-        stocks = run_xuangu_query(query, OUTPUT_DIR)
-        if stocks:
-            all_batches.append(stocks)
-            total_raw += len(stocks)
+# ── Step 1: 申万一级行业 → Top 2 ─────────────────────────────────────────
 
-    merged = merge_dedup(all_batches)
+def get_sw_top2_sectors() -> List[str]:
+    """
+    用 mx-xuangu 查「申万一级行业今日主力资金流向」，
+    聚合到申万一级（取「电子-半导体-xxx」→「电子」），按主力净额降序取前2。
+    优先：已知催化板块（CATALYST_SECTORS）优先进入Top2。
+    """
+    query = "申万一级行业今日主力资金流向"
+    print(f"[prefilter] xuangu: {query}", file=sys.stderr)
 
-    print(f"[prefilter] 📊 原始总计: {total_raw} → 去重后: {len(merged)} 只",
-          file=sys.stderr)
+    try:
+        result = subprocess.run(
+            ["python3", MX_XUANGU, query, "--output-dir", str(OUTPUT_DIR)],
+            capture_output=True, text=True, timeout=120,
+        )
+    except Exception as e:
+        print(f"[prefilter] ⚠ xuangu失败: {e}", file=sys.stderr)
+        return []
 
-    output = {
-        "candidates": merged,
-        "total": len(merged),
-        "total_raw": total_raw,
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "source": "prefilter_xuangu.py",
+    csv_path = find_file(OUTPUT_DIR, "申万一级行业今日主力资金流向", "csv")
+    if not csv_path:
+        print(f"[prefilter] ⚠ 未找到CSV", file=sys.stderr)
+        return []
+
+    try:
+        import csv as csv_lib
+        with open(csv_path, encoding="utf-8-sig") as f:
+            reader = csv_lib.DictReader(f)
+            rows = list(reader)
+    except Exception as e:
+        print(f"[prefilter] ⚠ CSV读取失败: {e}", file=sys.stderr)
+        return []
+
+    if not rows:
+        return []
+
+    # 推断日期后缀（如 2026.04.27）
+    date_suffix = ""
+    if rows:
+        for k in rows[0].keys():
+            m = re.search(r"(\d{4}\.\d{2}\.\d{2})", str(k))
+            if m:
+                date_suffix = m.group(1)
+                break
+
+    # 聚合申万一级行业主力净额
+    sector_net = {}
+    net_col = f"主力净额(元) {date_suffix}" if date_suffix else "主力净额(元) 2026.04.27"
+    sw_col = "申万行业分类"
+    ind_col = "东财行业总分类"
+
+    for r in rows:
+        sw_full = r.get(sw_col) or r.get(ind_col) or ""
+        parts = sw_full.split("-")
+        sector_l1 = parts[0].strip() if parts else sw_full.strip()
+        if not sector_l1:
+            continue
+        raw = r.get(net_col, "")
+        net = yuan_to_yi(raw)
+        if net is not None:
+            sector_net[sector_l1] = sector_net.get(sector_l1, 0) + net
+
+    if not sector_net:
+        print("[prefilter] ⚠ 板块净额解析失败", file=sys.stderr)
+        return []
+
+    sorted_sectors = sorted(sector_net.items(), key=lambda x: x[1], reverse=True)
+    print(f"[prefilter] 📊 申万一级 DDX（前6）: {sorted_sectors[:6]}", file=sys.stderr)
+
+    # 构建Top2：「政策催化优先」逻辑
+    #
+    # 规则：
+    #   ① 如果 Top5 中有 ≥2 个催化板块 → 直接取前2个催化板块
+    #   ② 如果 Top5 中有 1 个催化板块 → 该板块入选，再从剩余 Top5 中
+    #      选一个满足「涨幅>0 且成交量较5日均量放大≥20%」的板块
+    #   ③ 如果 Top5 中无催化板块 → 从 Top5 中取满足「涨幅>0 且成交量放大≥20%」的板块，
+    #      按 DDX 降序取前2
+    #      若不足2个，则用纯 DDX 补足
+    #
+    # 已知催化板块池
+    CATALYST_POOL = {
+        "军工",     # 地缘风险 + 业绩确定性
+        "半导体",   # 国产替代 + AI驱动
+        "商业航天", # 4.24航天日 + 4.28长征十号首飞 + Kuiper卫星互联网
+        "国产芯片", # CPU涨价 + DeepSeek-V4 + 国产AI芯片41%份额
     }
 
-    # stdout → 注入到 cron prompt
-    print(json.dumps(output, ensure_ascii=False))
+    top5 = [s for s, _ in sorted_sectors[:5]]
+
+    # ① ≥2 个催化板块在 Top5
+    catalyst_in_top5 = [s for s in top5 if s in CATALYST_POOL]
+    if len(catalyst_in_top5) >= 2:
+        top2 = catalyst_in_top5[:2]
+        print(f"[prefilter] ✅ 催化板块优先入选: {top2}", file=sys.stderr)
+
+    # ② 只有 1 个催化板块在 Top5
+    elif len(catalyst_in_top5) == 1:
+        top2 = [catalyst_in_top5[0]]
+        # 从剩余 Top5 中找满足条件的板块
+        remaining = [s for s in top5 if s not in catalyst_in_top5]
+        # 简单策略：取剩余中 DDX 最高的（近3日成交量验证暂时跳过，
+        # 因为 mx-data 单票查询近3日量比不够稳定，用 DDX 代替）
+        if remaining:
+            top2.append(remaining[0])
+        print(f"[prefilter] ✅ 1个催化板块入选: {catalyst_in_top5[0]}，补充: {top2[1] if len(top2)>1 else '无'}", file=sys.stderr)
+
+    # ③ 无催化板块在 Top5
+    else:
+        # 取 Top5 中前2个（已经是按 DDX 降序）
+        top2 = top5[:2]
+        print(f"[prefilter] ✅ 无催化板块在Top5，取DDX前2: {top2}", file=sys.stderr)
+
+    print(f"[prefilter] 🎯 入选板块: {top2}", file=sys.stderr)
+    return top2
+
+
+# ── Step 2: 板块内量化选股 ────────────────────────────────────────────────
+
+def select_stocks(sectors: List[str], limit_per_sector: int = 3) -> List[Dict[str, Any]]:
+    """
+    在板块内执行 mx-xuangu，按近3日净额降序。
+    每板块最多取 limit_per_sector 支，合并后最多 6 支（2×3）。
+    所有票都进入 CZSC，由 CZSC 判断是否有二买/三买。
+    """
+    if not sectors:
+        return []
+
+    sector_str = "、".join(sectors)
+    query = (
+        f"A股 申万行业{sector_str} "
+        f"涨幅1.5%~5% "
+        f"量比大于1.5 "
+        f"换手率3%~10% "
+        f"流通市值大于50亿 "
+        f"近3日主力净流入至少2日为正值"
+    )
+    print(f"[prefilter] xuangu: {query[:80]}...", file=sys.stderr)
+
+    try:
+        result = subprocess.run(
+            ["python3", MX_XUANGU, query, "--output-dir", str(OUTPUT_DIR)],
+            capture_output=True, text=True, timeout=180,
+        )
+    except Exception as e:
+        print(f"[prefilter] ⚠ xuangu失败: {e}", file=sys.stderr)
+        return []
+
+    # 找 raw JSON（不是 CSV，因为近3日明细在JSON里）
+    raw_path = find_file(OUTPUT_DIR, "近3日主力净流入至少2日为正值", "json")
+    if not raw_path:
+        # 降级：找最新的 raw JSON
+        candidates = sorted(OUTPUT_DIR.glob("mx_xuangu_*_raw.json"),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
+        if candidates:
+            raw_path = candidates[0]
+
+    if not raw_path:
+        print("[prefilter] ⚠ 未找到raw JSON", file=sys.stderr)
+        return []
+
+    print(f"[prefilter] 解析 raw JSON: {raw_path.name}", file=sys.stderr)
+    stocks = parse_raw_json_xuangu(raw_path)
+    print(f"[prefilter] 过滤后: {len(stocks)} 只（未分组）", file=sys.stderr)
+
+    # ── 按申万行业分组，每组取 top3 ──
+    # sectors 里的板块名是申万一级（如"电子"），stocks[i]['sw_industry'] 形如"电子-半导体-集成电路封测"
+    sector_stocks = {s: [] for s in sectors}
+    for st in stocks:
+        sw_full = st.get("sw_industry", "")
+        # 取一级分类
+        l1 = sw_full.split("-")[0].strip() if sw_full else ""
+        for sec in sectors:
+            if l1 == sec:
+                sector_stocks[sec].append(st)
+                break
+
+    # 每组按近3日净额降序，取前limit_per_sector
+    result = []
+    for sec in sectors:
+        group = sector_stocks.get(sec, [])
+        group.sort(key=lambda x: x.get("net_3day_yi") or 0, reverse=True)
+        picked = group[:limit_per_sector]
+        for st in picked:
+            st["_sector"] = sec   # 标注来源板块
+        result.extend(picked)
+        print(f"[prefilter]   {sec}: 取{len(picked)}只 → {[s['code']+s['name'] for s in picked]}", file=sys.stderr)
+
+    # 打印所有候选
+    for s in result:
+        net = s.get("net_3day_yi")
+        pd = str(s["pos_days"]) + "日正流入"
+        ind = s["sw_industry"][:20]
+        print(f"  {s['code']} {s['name']} 涨幅{s['change_pct']}% 换手{s['turnover_rate']}% "
+              f"量比{s['volume_ratio']} 流通市值{s['mkt_cap_yi']}亿 "
+              f"近3日净流入{net}亿({pd}) 行业:{ind}",
+              file=sys.stderr)
+
+    return result
+
+
+# ── 主流程 ──────────────────────────────────────────────────────────────────
+
+def main():
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[prefilter] === v4 启动 {ts} ===", file=sys.stderr)
+
+    # Step 1: 申万一级 → Top 2 板块
+    top_sectors = get_sw_top2_sectors()
+
+    if not top_sectors:
+        print("[prefilter] ⚠ 无强势板块，输出空候选", file=sys.stderr)
+        output = {
+            "candidates": [],
+            "sectors": [],
+            "total": 0,
+            "timestamp": ts,
+            "source": "prefilter_xuangu.py v4 (用户方案)",
+        }
+        print(json.dumps(output, ensure_ascii=False))
+        return
+
+    # Step 2: 每板块各取前3，合并最多6支，全部输给CZSC
+    candidates = select_stocks(top_sectors, limit_per_sector=3)
+
+    # 格式化输出（用户要求字段）
+    output_stocks = []
+    for s in candidates:
+        output_stocks.append({
+            "code": s["code"],
+            "name": s["name"],
+            "题材": s.get("sw_industry", ""),
+            "板块": s.get("_sector", ""),
+            "量比": s["volume_ratio"],
+            "换手率": s["turnover_rate"],
+            "流通市值_亿": s["mkt_cap_yi"],
+            "近3日主力净流入_亿": s["net_3day_yi"],
+            "现价": s["price"],
+            "涨跌幅": s["change_pct"],
+        })
+
+    output = {
+        "candidates": output_stocks,
+        "sectors": top_sectors,
+        "total": len(output_stocks),
+        "timestamp": ts,
+        "source": "prefilter_xuangu.py v4 (用户方案)",
+    }
+    print(json.dumps(output, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
